@@ -13,7 +13,7 @@
 // After that, WiFi is managed from  Gemini > SET > WiFi  and stored in flash.
 const char* WIFI_SSID    = "WIFI_SSID";
 const char* WIFI_PASS    = "WIFI_PASS";
-const char* BOT_TOKEN    = "GEMINI_TOKEN";
+const char* BOT_TOKEN    = "TOKEN";
 const char* GEMINI_MODEL = "gemini-3-flash-preview";
 #define REPLY_SCALE 1
 #define MAX_DRAFT   300
@@ -875,6 +875,7 @@ int doScan() {
 
 bool tryJoin(const String& ssid, const String& pass, unsigned long timeoutMs) {
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);                    // recover by itself from brief router drops
   WiFi.setSleep(true);
   WiFi.disconnect(false);
   delay(50);
@@ -920,6 +921,22 @@ bool connectBest(bool toReply) {
   return false;
 }
 
+// make sure WiFi is up: quick reconnect first, then full scan + join of saved networks
+bool ensureWifi(bool toReply) {
+  if (WiFi.status() == WL_CONNECTED) { lastWifiUse = millis(); return true; }
+  if (nets.empty()) return false;
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.reconnect();
+    unsigned long t = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t < 4000) {
+      if (pollExit()) { cancelled = true; return false; }
+      delay(100);
+    }
+    if (WiFi.status() == WL_CONNECTED) { lastWifiUse = millis(); return true; }
+  }
+  return connectBest(toReply);     // radio was off or reconnect failed
+}
+
 // ---------- Gemini (raw socket so EXIT stays live; optional image attached) ----------
 String dechunk(String s) {
   String out; int i = 0;
@@ -936,14 +953,10 @@ String dechunk(String s) {
 
 String askGemini(const String& prompt, bool withImage) {
   cancelled = false;
-  if (WiFi.status() != WL_CONNECTED) {
-    if (!connectBest(true)) {
-      if (cancelled) return "";
-      return "WiFi not connected. Open SET > WiFi and join a network.";
-    }
-    setReply("Thinking...  (tap EXIT to cancel)");
+  if (!ensureWifi(true)) {
+    if (cancelled) return "";
+    return "WiFi not connected.";
   }
-  lastWifiUse = millis();
 
   String sysI = "You receive user content. If an image is attached, it is a hand-drawn "
                 "sketch (physics circuit, graph, handwritten numbers/text, diagram). "
@@ -956,8 +969,7 @@ String askGemini(const String& prompt, bool withImage) {
   String body = "{\"system_instruction\":{\"parts\":[{\"text\":\"" + jsonEscape(sysI) + "\"}]},"
                 "\"contents\":[{\"role\":\"user\",\"parts\":[" + parts +
                 "{\"text\":\"" + jsonEscape(prompt) + "\"}]}],"
-                "\"generationConfig\":{\"maxOutputTokens\":" + String(ANS_TOK[ansLenIdx]) +
-                ",\"thinkingConfig\":{\"thinkingBudget\":0}}}";
+                "\"generationConfig\":{\"maxOutputTokens\":800,\"thinkingConfig\":{\"thinkingBudget\":0}}}";
 
   WiFiClientSecure client;
   client.setInsecure();
@@ -983,11 +995,10 @@ String askGemini(const String& prompt, bool withImage) {
   unsigned long start = millis();
   while ((client.connected() || client.available()) && millis() - start < 45000) {
     if (pollExit()) { client.stop(); cancelled = true; return ""; }
-    while (client.available()) { resp += (char)client.read(); start = millis(); }
+    while (client.available()) { resp += (char)client.read(); start = millis(); lastWifiUse = millis(); }
     delay(5);
   }
   client.stop();
-  lastWifiUse = millis();
 
   int bi = resp.indexOf("\r\n\r\n");
   if (bi < 0) return "Bad response from server.";
@@ -1955,12 +1966,16 @@ void loop() {
     drawGemMain();
   }
 
-  // on-demand WiFi: switch the radio off when idle
-  if (wifiMode == 1 && WiFi.getMode() != WIFI_OFF && millis() - lastWifiUse > WIFI_IDLE_MS) {
-    bool busy = (app == APP_GEM) && (gscr == G_WIFI || gscr == G_NETS || (gscr == G_KB && entryMode != EM_DRAFT));
-    if (!busy) {
-      wifiOff();
-      if (app == APP_GEM && gscr == G_MAIN && screenOn) drawWifiTag();
+  // on-demand WiFi: switch the radio off only when truly idle
+  if (wifiMode == 1 && WiFi.getMode() != WIFI_OFF) {
+    unsigned long lastUse = lastWifiUse;
+    if (app == APP_GEM && lastAct > lastUse) lastUse = lastAct;   // typing/drawing counts as use
+    if (millis() - lastUse > WIFI_IDLE_MS) {
+      bool busy = (app == APP_GEM) && (gscr == G_WIFI || gscr == G_NETS || (gscr == G_KB && entryMode != EM_DRAFT));
+      if (!busy) {
+        wifiOff();
+        if (app == APP_GEM && gscr == G_MAIN && screenOn) drawWifiTag();
+      }
     }
   }
 
